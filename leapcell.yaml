@@ -1,0 +1,31 @@
+# Leapcell.io Deployment Configuration
+# YouTube Shorts Video Generator
+
+service:
+  name: youtube-shorts-api
+  runtime: python
+  port: 8080
+
+build:
+  # Install FFmpeg + fonts for text support
+  command: |
+    apt-get update && apt-get install -y ffmpeg fonts-dejavu-core && \
+    pip install -r requirements.txt
+
+start:
+  # Single worker for memory efficiency, extended timeout for video processing
+  command: gunicorn -w 1 -b :8080 --timeout 300 app:app
+
+env:
+  PYTHONUNBUFFERED: "1"
+  FFMPEG_LOG_LEVEL: "error"
+
+resources:
+  # Minimum 1GB RAM recommended for FFmpeg processing
+  memory: 1Gi
+  # CPU: default (adjust if needed)
+
+# Auto-deploy on push to main branch
+deploy:
+  branch: main
+  auto: true
