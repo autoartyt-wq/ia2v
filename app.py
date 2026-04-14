@@ -6,14 +6,14 @@ GET  /health                    - Health check
 GET  /                          - API documentation
 POST /create-video              - Images from URLs + Audio upload
 """
-from flask import Flask, request, jsonify, send_file, url_for
+from flask import Flask, request, jsonify
 import os, uuid, json, shutil, requests, time
 from config import Config
 from utils.video_builder import VideoBuilder
+from utils.object_storage import upload_to_object_storage
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB upload limit
 ALLOWED_AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg'}
-GENERATED_VIDEOS = {}
 
 def allowed_file(filename, extensions):
     """Check if file extension is allowed"""
@@ -66,19 +66,24 @@ def normalize_effects(effects_input, required_count=10):
 
     return resolved, None
 
-def cleanup_expired_videos(now_ts):
-    """Remove expired generated videos from temp storage and in-memory index."""
-    expired_ids = [
-        job_id for job_id, meta in GENERATED_VIDEOS.items()
-        if now_ts - meta.get('created_at', 0) > Config.GENERATED_URL_TTL_SECONDS
-    ]
-    for job_id in expired_ids:
-        meta = GENERATED_VIDEOS.pop(job_id, None)
-        if not meta:
-            continue
-        temp_dir = meta.get('temp_dir')
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
+def fetch_url_with_retries(url, timeout_seconds=30, retries=2):
+    """Fetch URL content with small retries to reduce transient network failures."""
+    last_error = None
+    headers = {
+        "User-Agent": "ia2v-video-builder/1.0"
+    }
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout_seconds, headers=headers)
+            resp.raise_for_status()
+            if not resp.content:
+                raise ValueError("Downloaded response is empty")
+            return resp
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(0.8 + attempt * 0.7)
+    raise last_error
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -94,20 +99,28 @@ def index():
     """API documentation endpoint"""
     return jsonify({
         "service": "YouTube Shorts Video Generator",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "info": "All videos are uploaded to Leapcell Object Storage and returned as download links",
         "endpoints": {
             "GET /health": "Health check",
             "GET /": "This documentation",
-            "POST /create-video": "Create video: image URLs + audio upload",
-            "GET /videos/<job_id>": "Download generated video when return_url=true"
+            "POST /create-video": "Create video: image URLs + audio upload -> returns object storage download link"
         },
         "usage": {
             "/create-video": {
                 "method": "POST",
                 "content_type": "multipart/form-data",
                 "fields": {
-                    "data": "JSON: {images: string[10], mode: 'simple'|'advanced', captions: string[10], effects: string|string[1]|string[10], return_url: boolean}",
+                    "data": "JSON: {images: string[10], mode: 'simple'|'advanced', captions: string[10], effects: string|string[1]|string[10]}",
                     "audio": "Audio file (mp3, wav, m4a, aac, flac, ogg)"
+                },
+                "response": {
+                    "status": "success",
+                    "job_id": "UUID of job",
+                    "download_url": "https://<public-base>/<bucket>/<object_key>",
+                    "object_key": "Object key inside bucket",
+                    "size_mb": "Generated video size",
+                    "storage": "leapcell_object_storage"
                 },
                 "example": "curl -X POST URL -F 'data={\"images\":[\"url1\",...],\"effects\":\"effect_key_00\"}' -F 'audio=@file.mp3'"
             }
@@ -151,9 +164,6 @@ def create_video():
         except json.JSONDecodeError:
             return jsonify({"error": "Invalid JSON in 'data' field"}), 400
         
-        # If true, endpoint returns JSON with downloadable URL instead of binary payload.
-        return_url = parse_bool(params.get('return_url'), default=False)
-
         # Validate images array
         images = params.get('images', [])
         if not isinstance(images, list) or len(images) != 10:
@@ -193,8 +203,7 @@ def create_video():
         image_paths = []
         for i, img_url in enumerate(images):
             try:
-                resp = requests.get(img_url, timeout=30)
-                resp.raise_for_status()
+                resp = fetch_url_with_retries(img_url, timeout_seconds=30, retries=2)
                 
                 # Determine file extension
                 ext = 'jpg'  # default
@@ -230,6 +239,15 @@ def create_video():
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return jsonify({"error": "Failed to save audio file"}), 500
+
+        audio_duration = VideoBuilder._get_audio_duration(audio_path)
+        if audio_duration > Config.MAX_AUDIO_DURATION:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({
+                "error": "Audio duration exceeds maximum allowed",
+                "max_seconds": Config.MAX_AUDIO_DURATION,
+                "received_seconds": round(audio_duration, 2)
+            }), 400
         
         # === Generate Video ===
         output_path = os.path.join(temp_dir, 'output.mp4')
@@ -241,18 +259,30 @@ def create_video():
         
         # Calculate timeout: base + 3s per second of video
         timeout = Config.FFMPEG_TIMEOUT_BASE + int(duration * 3)
+        timeout = min(timeout, Config.FFMPEG_TIMEOUT_CAP)
         
         app.logger.info(f"Starting video generation: job={job_id}, duration={duration:.1f}s, timeout={timeout}s")
         
         success, message = VideoBuilder.run_command(cmd, timeout=timeout)
         
         if not success:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            app.logger.error(f"Video generation failed: {message}")
-            return jsonify({
-                "error": "Video generation failed",
-                "details": message[:500]
-            }), 500
+            app.logger.warning(f"Primary render failed, retrying with safe fade transitions: {message[:350]}")
+            fallback_cmd, _ = VideoBuilder.build_multi_effect_command(
+                image_paths,
+                audio_path,
+                output_path,
+                captions,
+                effects,
+                transition_override='fade',
+            )
+            success, fallback_message = VideoBuilder.run_command(fallback_cmd, timeout=timeout)
+            if not success:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                app.logger.error(f"Video generation failed after fallback: {fallback_message}")
+                return jsonify({
+                    "error": "Video generation failed",
+                    "details": fallback_message[:1200]
+                }), 500
         
         # Verify output was created
         if not os.path.exists(output_path):
@@ -285,33 +315,36 @@ def create_video():
         
         app.logger.info(f"Video generated successfully: job={job_id}, size={output_size} bytes")
 
-        now_ts = int(time.time())
-        cleanup_expired_videos(now_ts)
-        GENERATED_VIDEOS[job_id] = {
-            "path": output_path,
-            "temp_dir": temp_dir,
-            "created_at": now_ts,
-            "size": output_size,
-        }
-
-        if return_url:
-            download_url = request.host_url.rstrip('/') + url_for('download_video', job_id=job_id)
+        # === Upload to Object Storage (always, to bypass Leapcell response payload limit) ===
+        app.logger.info(f"Uploading video to object storage: {output_size} bytes")
+        upload_success, upload_data = upload_to_object_storage(
+            output_path,
+            object_key=f"videos/{job_id}/short_{job_id}.mp4",
+        )
+        
+        if upload_success:
+            app.logger.info(f"Object storage upload succeeded: {upload_data}")
+            # Clean up temp directory after successful upload
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
             return jsonify({
                 "status": "success",
                 "job_id": job_id,
-                "download_url": download_url,
-                "size_bytes": output_size,
-                "expires_in_seconds": Config.GENERATED_URL_TTL_SECONDS,
+                "download_url": upload_data['download_url'],
+                "object_key": upload_data['object_key'],
+                "size_mb": upload_data['file_size_mb'],
+                "storage": "leapcell_object_storage",
+                "message": "Video uploaded to object storage successfully."
             }), 200
-        
-        # === Send Video File ===
-        return send_file(
-            output_path,
-            mimetype='video/mp4',
-            as_attachment=True,
-            download_name=f'short_{job_id}.mp4',
-            max_age=3600  # Cache response for 1 hour
-        )
+        else:
+            app.logger.error(f"Object storage upload failed: {upload_data}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({
+                "error": "Failed to upload generated video",
+                "details": upload_data.get('error', 'Unknown error'),
+                "reason": upload_data.get('details', ''),
+                "suggestion": "Verify object storage endpoint, bucket, keys, and public base URL environment variables"
+            }), 500
         
     except Exception as e:
         app.logger.error(f"Unhandled error in create_video: {str(e)}", exc_info=True)
@@ -321,28 +354,6 @@ def create_video():
             "error": "Internal server error",
             "details": str(e)[:300]
         }), 500
-
-@app.route('/videos/<job_id>', methods=['GET'])
-def download_video(job_id):
-    """Download previously generated video when using return_url mode."""
-    now_ts = int(time.time())
-    cleanup_expired_videos(now_ts)
-    meta = GENERATED_VIDEOS.get(job_id)
-    if not meta:
-        return jsonify({"error": "Video URL expired or not found"}), 404
-
-    output_path = meta.get('path')
-    if not output_path or not os.path.exists(output_path):
-        GENERATED_VIDEOS.pop(job_id, None)
-        return jsonify({"error": "Video file not found"}), 404
-
-    return send_file(
-        output_path,
-        mimetype='video/mp4',
-        as_attachment=True,
-        download_name=f'short_{job_id}.mp4',
-        max_age=3600,
-    )
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
