@@ -85,6 +85,20 @@ def fetch_url_with_retries(url, timeout_seconds=30, retries=2):
                 time.sleep(0.8 + attempt * 0.7)
     raise last_error
 
+def should_retry_with_safe_fade(error_message):
+    """Retry only when FFmpeg failure likely comes from transition/filter incompatibility."""
+    if not error_message:
+        return False
+    msg = error_message.lower()
+    retry_markers = [
+        'xfade',
+        'error initializing complex filters',
+        'invalid argument',
+        'no such filter',
+        'error reinitializing filters',
+    ]
+    return any(marker in msg for marker in retry_markers)
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint for monitoring"""
@@ -266,16 +280,20 @@ def create_video():
         success, message = VideoBuilder.run_command(cmd, timeout=timeout)
         
         if not success:
-            app.logger.warning(f"Primary render failed, retrying with safe fade transitions: {message[:350]}")
-            fallback_cmd, _ = VideoBuilder.build_multi_effect_command(
-                image_paths,
-                audio_path,
-                output_path,
-                captions,
-                effects,
-                transition_override='fade',
-            )
-            success, fallback_message = VideoBuilder.run_command(fallback_cmd, timeout=timeout)
+            if should_retry_with_safe_fade(message):
+                app.logger.warning(f"Primary render failed, retrying with safe fade transitions: {message[:350]}")
+                fallback_cmd, _ = VideoBuilder.build_multi_effect_command(
+                    image_paths,
+                    audio_path,
+                    output_path,
+                    captions,
+                    effects,
+                    transition_override='fade',
+                )
+                success, fallback_message = VideoBuilder.run_command(fallback_cmd, timeout=timeout)
+            else:
+                success, fallback_message = False, message
+
             if not success:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 app.logger.error(f"Video generation failed after fallback: {fallback_message}")
